@@ -1,0 +1,2455 @@
+<?php
+declare(strict_types=1);
+
+/*
+ * Düşük Kotalı, Kesintisiz Token Döngülü & Çoklu Kaynaklı HLS Yönlendirme Sistemi (v.php v2.3)
+ *
+ * - Video segmentleri (.ts / .m4s) PHP üzerinden geçmez (doğrudan CDN'den çekilir).
+ * - Proaktif token yenileme + varyant haritası (vmap) ile token değişiminde
+ *   çözünürlük düşmeden ve yayın kopmadan kesintisiz geçiş sağlar.
+ * - Çoklu domain (huhu.to, oha.to, kool.to, vavoo.to) + çoklu User-Agent otomatik fallback.
+ * - Aynı klasördeki panel.php ve m3u.php ile tam uyumludur.
+ *
+ * Uç Noktalar:
+ *   v.php?p=player&id=KANAL_ID
+ *   v.php?p=live&id=KANAL_ID
+ *   v.php?p=token&id=KANAL_ID
+ *   v.php?p=diag              (veya v.php?p=diag&id=KANAL_ID)
+ *   v.php?list=Turkey.m3u     (veya all)
+ *   v.php?p=countries
+ */
+
+ini_set('display_errors', '0');
+error_reporting(E_ALL);
+
+header('X-Content-Type-Options: nosniff');
+header('Referrer-Policy: no-referrer');
+
+/* ---------------- Güvenlik & Yapılandırma ---------------- */
+/* Boş bırakılırsa herkes erişebilir. Sızıntıyı kapatmak için bir şifre yazın */
+const ACCESS_KEY = '';
+
+/* İsteğe bağlı alan adı beyaz listesi. Örn: ['yayin.siteniz.com'] — Boşsa HTTP_HOST doğrulanır */
+const ALLOWED_HOSTS = [];
+
+/* Opsiyonel dış HTTP/SOCKS5 proxy (AlwaysData IP'si Cloudflare'a takılırsa).
+ * Örn: 'http://kullanici:sifre@ip:port' veya 'socks5h://127.0.0.1:9050' */
+const UPSTREAM_PROXY = '';
+
+/* ---------------- Otomatik Site Adresi (Proxy/Cloudflare Uyumlu) ---------------- */
+$forwardedProto = '';
+if (!empty($_SERVER['HTTP_X_FORWARDED_PROTO']) && is_string($_SERVER['HTTP_X_FORWARDED_PROTO'])) {
+    $forwardedProto = strtolower(trim(explode(',', $_SERVER['HTTP_X_FORWARDED_PROTO'])[0]));
+}
+
+$https = (
+    (!empty($_SERVER['HTTPS']) && strtolower((string) $_SERVER['HTTPS']) !== 'off')
+    || (int) ($_SERVER['SERVER_PORT'] ?? 0) === 443
+    || $forwardedProto === 'https'
+    || (!empty($_SERVER['HTTP_X_FORWARDED_SSL']) && strtolower((string) $_SERVER['HTTP_X_FORWARDED_SSL']) === 'on')
+);
+
+$scheme = $https ? 'https' : 'http';
+$host = (string) ($_SERVER['HTTP_HOST'] ?? '');
+$script = (string) ($_SERVER['SCRIPT_NAME'] ?? '');
+
+if (
+    $host === ''
+    || preg_match('/[\x00-\x20\x7f\/\\\\?#@]/', $host)
+    || filter_var($scheme . '://' . $host . '/', FILTER_VALIDATE_URL) === false
+    || (ALLOWED_HOSTS !== [] && !in_array(strtolower(explode(':', $host)[0]), array_map('strtolower', ALLOWED_HOSTS), true))
+    || $script === ''
+    || !str_starts_with($script, '/')
+    || str_starts_with($script, '//')
+) {
+    http_response_code(400);
+    exit('Geçersiz site adresi.');
+}
+
+if (!defined('BASE_URL')) {
+    define('BASE_URL', $scheme . '://' . $host . $script);
+}
+if (!defined('STREAM_STARTED_AT')) {
+    define('STREAM_STARTED_AT', (float) ($_SERVER['REQUEST_TIME_FLOAT'] ?? microtime(true)));
+}
+const STREAM_LIB_VERSION = '2.3';
+
+unset($forwardedProto, $https, $scheme, $host, $script);
+
+/* ---------------- Sabitler ---------------- */
+const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+    . 'AppleWebKit/537.36 (KHTML, like Gecko) '
+    . 'Chrome/147.0.0.0 Safari/537.36';
+
+const API_USER_AGENTS = [
+    'okhttp/4.11.0',
+    'MediaHubMX/2',
+    'VAVOO/2.6',
+    UA,
+];
+
+const HLS_UA = 'VAVOO/2.6';
+const CLIENT_VERSION = '3.1.4';
+const PING_APP_VERSION = '3.1.0';
+
+const UPSTREAM_DOMAINS = [
+    'https://huhu.to',
+    'https://oha.to',
+    'https://kool.to',
+    'https://vavoo.to',
+];
+
+const PLAY_PATHS = [
+    '/web-iptv/play/',
+    '/vavoo-iptv/play/',
+];
+
+const PING_URLS = [
+    'https://www.vypn.net/api/app/ping',
+    'https://www.vavoo.tv/api/app/ping',
+    'https://cache.vypn.net/api/app/ping',
+];
+
+const GROUPS = [
+    'Turkey', 'Germany', 'United Kingdom', 'France',
+    'Italy', 'Spain', 'Arabia', 'Balkans', 'Russia',
+    'Poland', 'Portugal', 'Netherlands', 'Albania',
+    'Romania', 'Bulgaria',
+];
+
+const SIGNATURE_TTL = 900;          // 15 dk taze imza ömrü
+const SIGNATURE_STALE_TTL = 7200;   // Ping sunucusu kesintisinde 2 saat tolerans
+const CATALOG_TTL = 3600;           // 1 saat katalog yenileme ömrü
+const CATALOG_STALE_TTL = 604800;   // Upstream kesintisinde 7 gün bayat katalog fallback
+const RESOLVE_TTL_DEFAULT = 15;     // Varsayılan stream çözümleme ömrü (sn)
+const RESOLVE_STALE_TTL = 45;       // Yenileme/hata anında bayat fallback (sn)
+const PLAYLIST_TTL = 2;             // 300 kişi izlerken 2 sn'de 1 upstream istek
+const PLAYLIST_STALE_TTL = 18;      // Upstream gecikmesinde mevcut izleyicilere bayat servis
+const PLAYER_TOKEN_TTL = 604800;    // Player oturum token'ı (7 gün kesintisiz izleme)
+
+const REQUEST_TIMEOUT = 7;
+const PING_TIMEOUT = 4;
+const PLAYLIST_TIMEOUT = 10;
+const LOCK_WAIT_TIMEOUT = 8.0;
+
+const CACHE_GC_PROBABILITY = 100;
+const CACHE_GC_LOCK_TTL = 600;
+const CACHE_GC_SHORT_TTL = 21600;
+
+const ID_PATTERN = '/^[A-Za-z0-9_-]{1,128}$/D';
+const CACHE_DIR = __DIR__ . '/.stream_cache';
+
+/* ---------------- Yardımcılar ---------------- */
+function fail(int $status, string $message, array $extraHeaders = []): never {
+    http_response_code($status);
+    header('Content-Type: text/plain; charset=utf-8');
+    header('Cache-Control: no-store, no-cache, must-revalidate');
+    foreach ($extraHeaders as $h) {
+        header($h);
+    }
+    echo $message;
+    exit;
+}
+
+function send_compressed(string $body, string $contentType, array $extraHeaders = []): never {
+    http_response_code(200);
+    header('Content-Type: ' . $contentType);
+    header('Cache-Control: no-store, no-cache, must-revalidate');
+    foreach ($extraHeaders as $h) {
+        header($h);
+    }
+
+    $acceptEncoding = (string) ($_SERVER['HTTP_ACCEPT_ENCODING'] ?? '');
+    if (
+        strlen($body) >= 256
+        && str_contains(strtolower($acceptEncoding), 'gzip')
+        && function_exists('gzencode')
+        && !ini_get('zlib.output_compression')
+    ) {
+        $gz = @gzencode($body, 5);
+        if (is_string($gz)) {
+            header('Content-Encoding: gzip');
+            header('Vary: Accept-Encoding');
+            header('Content-Length: ' . strlen($gz));
+            echo $gz;
+            exit;
+        }
+    }
+
+    header('Content-Length: ' . strlen($body));
+    echo $body;
+    exit;
+}
+
+function json_out(array $data, int $status = 200): never {
+    $json = json_encode(
+        $data,
+        JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE
+    );
+
+    if ($status === 200 && is_string($json)) {
+        send_compressed($json, 'application/json; charset=utf-8');
+    }
+
+    http_response_code($status);
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store, no-cache, must-revalidate');
+    echo is_string($json) ? $json : '{}';
+    exit;
+}
+
+function html_out(string $html): never {
+    send_compressed($html, 'text/html; charset=utf-8');
+}
+
+if (!function_exists('e')) {
+    function e(string $value): string {
+        return htmlspecialchars($value, ENT_QUOTES, 'UTF-8');
+    }
+}
+
+if (!function_exists('param')) {
+    function param(string $name, string $default = ''): string {
+        return isset($_GET[$name]) && is_string($_GET[$name])
+            ? $_GET[$name]
+            : $default;
+    }
+}
+
+function auth_query_suffix(): string {
+    return ACCESS_KEY !== '' ? '&key=' . rawurlencode(ACCESS_KEY) : '';
+}
+
+function budget(): float {
+    return max(1.0, 27.0 - (microtime(true) - STREAM_STARTED_AT));
+}
+
+function is_public_http_url(string $url): bool {
+    if ($url === '' || filter_var($url, FILTER_VALIDATE_URL) === false) {
+        return false;
+    }
+    $parts = parse_url($url);
+    if (!is_array($parts)) {
+        return false;
+    }
+    $scheme = strtolower((string) ($parts['scheme'] ?? ''));
+    $host = strtolower((string) ($parts['host'] ?? ''));
+    if (!in_array($scheme, ['http', 'https'], true) || $host === '') {
+        return false;
+    }
+    if ($host === 'localhost' || str_ends_with($host, '.local') || str_ends_with($host, '.internal')) {
+        return false;
+    }
+    $cleanHost = trim($host, '[]');
+    if (filter_var($cleanHost, FILTER_VALIDATE_IP) !== false) {
+        return filter_var(
+            $cleanHost,
+            FILTER_VALIDATE_IP,
+            FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE
+        ) !== false;
+    }
+    return true;
+}
+
+/* ---------------- Cache + Single-Flight + SWR ---------------- */
+function cache_dir(): ?string {
+    static $dir = null;
+    if ($dir !== null) {
+        return $dir === false ? null : $dir;
+    }
+
+    if (!is_dir(CACHE_DIR) && !@mkdir(CACHE_DIR, 0700, true)) {
+        $dir = false;
+        return null;
+    }
+
+    if (!is_writable(CACHE_DIR)) {
+        $dir = false;
+        return null;
+    }
+
+    $htaccess = CACHE_DIR . '/.htaccess';
+    if (!is_file($htaccess)) {
+        @file_put_contents($htaccess, "Require all denied\nDeny from all\n");
+    }
+
+    $index = CACHE_DIR . '/index.php';
+    if (!is_file($index)) {
+        @file_put_contents($index, "<?php http_response_code(403); exit;\n");
+    }
+
+    $dir = CACHE_DIR;
+    return $dir;
+}
+
+function cache_path(string $key): ?string {
+    $dir = cache_dir();
+    return $dir === null ? null : $dir . '/' . hash('sha256', $key) . '.cache';
+}
+
+function lock_path(string $key): ?string {
+    $dir = cache_dir();
+    return $dir === null ? null : $dir . '/' . hash('sha256', $key) . '.lock';
+}
+
+function cache_read_entry(string $key): ?array {
+    $path = cache_path($key);
+    if ($path === null || !is_file($path)) {
+        return null;
+    }
+
+    $raw = @file_get_contents($path);
+    if (!is_string($raw) || $raw === '') {
+        return null;
+    }
+
+    $data = json_decode($raw, true);
+    if (!is_array($data) || !isset($data['t']) || !array_key_exists('v', $data)) {
+        return null;
+    }
+
+    return [
+        't' => (int) $data['t'],
+        'ttl' => isset($data['ttl']) ? (int) $data['ttl'] : null,
+        'v' => $data['v'],
+    ];
+}
+
+function cache_read(string $key, int $ttl): mixed {
+    $entry = cache_read_entry($key);
+    if ($entry === null) {
+        return null;
+    }
+
+    $effectiveTtl = $entry['ttl'] ?? $ttl;
+    if (time() - $entry['t'] >= $effectiveTtl) {
+        return null;
+    }
+
+    return $entry['v'];
+}
+
+function cache_write(string $key, mixed $value, ?int $customTtl = null): void {
+    $path = cache_path($key);
+    if ($path === null) {
+        return;
+    }
+
+    $payload = ['t' => time(), 'v' => $value];
+    if ($customTtl !== null) {
+        $payload['ttl'] = $customTtl;
+    }
+
+    $json = json_encode($payload, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    if ($json === false) {
+        return;
+    }
+
+    $tmp = $path . '.' . bin2hex(random_bytes(4)) . '.tmp';
+    if (@file_put_contents($tmp, $json, LOCK_EX) !== false) {
+        if (!@rename($tmp, $path)) {
+            @unlink($tmp);
+        }
+    }
+}
+
+function cache_delete(string $key): void {
+    $path = cache_path($key);
+    if ($path !== null && is_file($path)) {
+        @unlink($path);
+    }
+}
+
+function cache_fetch_swr(
+    string $key,
+    int $freshTtl,
+    int $staleTtl,
+    callable $loader,
+    bool $forceRefresh = false,
+    int $minForceInterval = 2
+): mixed {
+    $now = time();
+    $entry = cache_read_entry($key);
+
+    if ($entry !== null) {
+        $age = $now - $entry['t'];
+        $effectiveFresh = $entry['ttl'] ?? $freshTtl;
+
+        if (!$forceRefresh && $age < $effectiveFresh) {
+            return $entry['v'];
+        }
+        if ($forceRefresh && $age < $minForceInterval) {
+            return $entry['v'];
+        }
+    }
+
+    $hasStale = $entry !== null && ($now - $entry['t']) < $staleTtl;
+    $lockFile = lock_path($key);
+
+    if ($lockFile === null) {
+        $fresh = $loader();
+        return is_array($fresh) && array_key_exists('__value', $fresh) ? $fresh['__value'] : $fresh;
+    }
+
+    $fp = @fopen($lockFile, 'c+');
+    if ($fp === false) {
+        if ($hasStale && !$forceRefresh) {
+            return $entry['v'];
+        }
+        $fresh = $loader();
+        return is_array($fresh) && array_key_exists('__value', $fresh) ? $fresh['__value'] : $fresh;
+    }
+
+    $gotLock = @flock($fp, LOCK_EX | LOCK_NB);
+
+    if (!$gotLock) {
+        if ($hasStale && !$forceRefresh) {
+            @fclose($fp);
+            return $entry['v'];
+        }
+
+        $deadline = microtime(true) + min(LOCK_WAIT_TIMEOUT, max(1.0, budget() - 1.0));
+        while (!$gotLock && microtime(true) < $deadline) {
+            usleep(50000);
+            $recheck = cache_read_entry($key);
+            if ($recheck !== null) {
+                $recheckAge = time() - $recheck['t'];
+                $recheckTtl = $recheck['ttl'] ?? $freshTtl;
+                if ((!$forceRefresh && $recheckAge < $recheckTtl) || ($forceRefresh && $recheckAge < $minForceInterval)) {
+                    @fclose($fp);
+                    return $recheck['v'];
+                }
+            }
+            $gotLock = @flock($fp, LOCK_EX | LOCK_NB);
+        }
+
+        if (!$gotLock) {
+            @fclose($fp);
+            if ($hasStale) {
+                return $entry['v'];
+            }
+            throw new RuntimeException('Yayın hazırlanıyor, tekrar deneniyor.');
+        }
+    }
+
+    $recheck = cache_read_entry($key);
+    if ($recheck !== null) {
+        $recheckAge = time() - $recheck['t'];
+        $recheckTtl = $recheck['ttl'] ?? $freshTtl;
+        if ((!$forceRefresh && $recheckAge < $recheckTtl) || ($forceRefresh && $recheckAge < $minForceInterval)) {
+            @flock($fp, LOCK_UN);
+            @fclose($fp);
+            return $recheck['v'];
+        }
+    }
+
+    try {
+        $fresh = $loader();
+        $customTtl = null;
+        $value = $fresh;
+
+        if (is_array($fresh) && array_key_exists('__value', $fresh)) {
+            $value = $fresh['__value'];
+            $customTtl = isset($fresh['__ttl']) ? (int) $fresh['__ttl'] : null;
+        }
+
+        cache_write($key, $value, $customTtl);
+        return $value;
+    } catch (Throwable $ex) {
+        if ($hasStale && !$forceRefresh) {
+            return $entry['v'];
+        }
+        throw $ex;
+    } finally {
+        @flock($fp, LOCK_UN);
+        @fclose($fp);
+    }
+}
+
+function cache_gc(): void {
+    try {
+        if (random_int(1, CACHE_GC_PROBABILITY) !== 1) {
+            return;
+        }
+    } catch (Throwable) {
+        return;
+    }
+
+    $dir = cache_dir();
+    if ($dir === null) {
+        return;
+    }
+
+    $now = time();
+    $files = @glob($dir . '/*');
+    if (!is_array($files)) {
+        return;
+    }
+
+    foreach ($files as $file) {
+        if (!is_file($file)) {
+            continue;
+        }
+        $base = basename($file);
+        if ($base === '.htaccess' || $base === 'index.php' || $base === '.secret') {
+            continue;
+        }
+        $mtime = @filemtime($file);
+        if ($mtime === false) {
+            continue;
+        }
+        $age = $now - $mtime;
+
+        if (str_ends_with($base, '.tmp') && $age > 120) {
+            @unlink($file);
+            continue;
+        }
+
+        if (str_ends_with($base, '.lock') && $age > CACHE_GC_LOCK_TTL) {
+            $fp = @fopen($file, 'c+');
+            if ($fp !== false) {
+                if (@flock($fp, LOCK_EX | LOCK_NB)) {
+                    @unlink($file);
+                    @flock($fp, LOCK_UN);
+                }
+                @fclose($fp);
+            }
+            continue;
+        }
+
+        if (str_ends_with($base, '.cache') && $age > CACHE_GC_SHORT_TTL) {
+            $raw = @file_get_contents($file);
+            if (!is_string($raw) || $raw === '') {
+                @unlink($file);
+                continue;
+            }
+            $data = json_decode($raw, true);
+            if (!is_array($data)) {
+                @unlink($file);
+                continue;
+            }
+            $entryTtl = isset($data['ttl']) ? (int) $data['ttl'] : null;
+            if ($entryTtl !== null && $entryTtl <= 300 && $age > max(1800, $entryTtl * 20)) {
+                @unlink($file);
+            } elseif ($age > 1209600) {
+                @unlink($file);
+            }
+        }
+    }
+}
+
+/* ---------------- İmza / Player Token ---------------- */
+function app_secret(): string {
+    static $secret = null;
+    if ($secret !== null) {
+        return $secret;
+    }
+
+    $dir = cache_dir();
+    if ($dir !== null) {
+        $path = $dir . '/.secret';
+        if (is_file($path)) {
+            $raw = trim((string) @file_get_contents($path));
+            if (strlen($raw) >= 32) {
+                $secret = $raw;
+                return $secret;
+            }
+        }
+        $generated = bin2hex(random_bytes(32));
+        if (@file_put_contents($path, $generated, LOCK_EX) !== false) {
+            @chmod($path, 0600);
+            $secret = $generated;
+            return $secret;
+        }
+    }
+
+    $secret = hash('sha256', __FILE__ . '|' . php_uname('n'));
+    return $secret;
+}
+
+function sign_sub_url(string $id, string $url): string {
+    return hash_hmac('sha256', $id . '|' . $url, app_secret());
+}
+
+function create_player_token(string $id): string {
+    $exp = time() + PLAYER_TOKEN_TTL;
+    $sig = hash_hmac('sha256', 'pt|' . $id . '|' . $exp, app_secret());
+    return $exp . '.' . $sig;
+}
+
+function verify_player_token(string $id, string $token): bool {
+    if ($token === '' || !str_contains($token, '.')) {
+        return false;
+    }
+    [$expStr, $sig] = explode('.', $token, 2);
+    if (!ctype_digit($expStr) || $sig === '') {
+        return false;
+    }
+    if ((int) $expStr < time()) {
+        return false;
+    }
+    $expected = hash_hmac('sha256', 'pt|' . $id . '|' . $expStr, app_secret());
+    return hash_equals($expected, $sig);
+}
+
+/* ---------------- HTTP & Cloudflare Algılama ---------------- */
+function apply_curl_proxy($ch): void {
+    if (UPSTREAM_PROXY !== '') {
+        curl_setopt($ch, CURLOPT_PROXY, UPSTREAM_PROXY);
+    }
+}
+
+function is_cloudflare_challenge(int $status, string $body, array $headers = []): bool {
+    $cfMitigated = strtolower((string) ($headers['cf-mitigated'] ?? ''));
+    if ($cfMitigated === 'challenge') {
+        return true;
+    }
+    if (!in_array($status, [403, 503], true)) {
+        return false;
+    }
+    return str_contains($body, 'Just a moment')
+        || str_contains($body, 'cf-browser-verification')
+        || str_contains($body, 'challenge-platform')
+        || str_contains($body, '_cf_chl_opt')
+        || str_contains($body, 'Attention Required! | Cloudflare');
+}
+
+function post_json(
+    string $url,
+    array $payload,
+    array $headers = [],
+    ?int $maxTimeout = null,
+    ?string $userAgent = null
+): array {
+    $limit = $maxTimeout ?? REQUEST_TIMEOUT;
+    $attempts = 2;
+    $lastException = null;
+    $ua = $userAgent ?? API_USER_AGENTS[0];
+
+    for ($attempt = 0; $attempt < $attempts; $attempt++) {
+        $timeout = max(1, min($limit, (int) floor(budget())));
+        if ($timeout <= 1 && $attempt > 0) {
+            break;
+        }
+
+        $ch = curl_init($url);
+        if ($ch === false) {
+            throw new RuntimeException('cURL başlatılamadı.');
+        }
+
+        $respHeaders = [];
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => json_encode(
+                $payload,
+                JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR
+            ),
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_CONNECTTIMEOUT => min(4, $timeout),
+            CURLOPT_TIMEOUT => $timeout,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
+            CURLOPT_ENCODING => '',
+            CURLOPT_TCP_KEEPALIVE => 1,
+            CURLOPT_USERAGENT => $ua,
+            CURLOPT_HTTPHEADER => array_merge([
+                'Content-Type: application/json; charset=utf-8',
+                'Accept: application/json',
+                'Connection: keep-alive',
+            ], $headers),
+            CURLOPT_HEADERFUNCTION => static function ($curl, string $headerLine) use (&$respHeaders): int {
+                $pos = strpos($headerLine, ':');
+                if ($pos !== false) {
+                    $k = strtolower(trim(substr($headerLine, 0, $pos)));
+                    $v = trim(substr($headerLine, $pos + 1));
+                    $respHeaders[$k] = $v;
+                }
+                return strlen($headerLine);
+            },
+        ]);
+        apply_curl_proxy($ch);
+
+        $body = curl_exec($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $error = curl_error($ch);
+        $errno = curl_errno($ch);
+        curl_close($ch);
+
+        if ($body === false) {
+            $lastException = new RuntimeException('cURL ' . $errno . ': ' . $error);
+            if ($attempt === 0 && budget() > 4.0) {
+                usleep(120000);
+                continue;
+            }
+            throw $lastException;
+        }
+
+        $bodyStr = (string) $body;
+        if (
+            $attempt === 0
+            && !is_cloudflare_challenge($status, $bodyStr, $respHeaders)
+            && ($status === 429 || $status >= 500)
+            && budget() > 4.0
+        ) {
+            usleep(150000);
+            continue;
+        }
+
+        return [
+            'status' => $status,
+            'json' => json_decode($bodyStr, true),
+            'body' => $bodyStr,
+            'headers' => $respHeaders,
+        ];
+    }
+
+    throw $lastException ?? new RuntimeException('HTTP POST başarısız.');
+}
+
+function post_json_multi(array $requests): array {
+    if ($requests === []) {
+        return [];
+    }
+
+    $mh = curl_multi_init();
+    $handles = [];
+    $timeout = max(2, min(REQUEST_TIMEOUT, (int) floor(budget())));
+
+    foreach ($requests as $key => $req) {
+        $ch = curl_init($req['url']);
+        if ($ch === false) {
+            continue;
+        }
+        curl_setopt_array($ch, [
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => json_encode(
+                $req['payload'],
+                JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR
+            ),
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_CONNECTTIMEOUT => min(4, $timeout),
+            CURLOPT_TIMEOUT => $timeout,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTPS,
+            CURLOPT_ENCODING => '',
+            CURLOPT_TCP_KEEPALIVE => 1,
+            CURLOPT_USERAGENT => $req['ua'] ?? API_USER_AGENTS[0],
+            CURLOPT_HTTPHEADER => array_merge([
+                'Content-Type: application/json; charset=utf-8',
+                'Accept: application/json',
+                'Connection: keep-alive',
+            ], $req['headers'] ?? []),
+        ]);
+        apply_curl_proxy($ch);
+        curl_multi_add_handle($mh, $ch);
+        $handles[$key] = $ch;
+    }
+
+    $running = null;
+    do {
+        $status = curl_multi_exec($mh, $running);
+        if ($running > 0) {
+            curl_multi_select($mh, 0.2);
+        }
+    } while ($running > 0 && $status === CURLM_OK);
+
+    $results = [];
+    foreach ($handles as $key => $ch) {
+        $body = curl_multi_getcontent($ch);
+        $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $error = curl_error($ch);
+        $bodyStr = is_string($body) ? $body : '';
+        $results[$key] = [
+            'status' => $httpCode,
+            'json' => $bodyStr !== '' ? json_decode($bodyStr, true) : null,
+            'body' => $bodyStr,
+            'error' => $error,
+        ];
+        curl_multi_remove_handle($mh, $ch);
+        curl_close($ch);
+    }
+
+    curl_multi_close($mh);
+    return $results;
+}
+
+function get_text(string $url, array $headers = []): array {
+    $currentUrl = str_replace(' ', '%20', $url);
+
+    for ($redir = 0; $redir <= 5; $redir++) {
+        $currentUrl = str_replace(' ', '%20', $currentUrl);
+        if (!is_public_http_url($currentUrl)) {
+            throw new RuntimeException('Geçersiz veya güvenli olmayan upstream adresi.');
+        }
+
+        $timeout = max(1, min(PLAYLIST_TIMEOUT, (int) floor(budget())));
+        $ch = curl_init($currentUrl);
+        if ($ch === false) {
+            throw new RuntimeException('cURL başlatılamadı.');
+        }
+
+        $redirectLocation = null;
+        curl_setopt_array($ch, [
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_FOLLOWLOCATION => false,
+            CURLOPT_CONNECTTIMEOUT => min(4, $timeout),
+            CURLOPT_TIMEOUT => $timeout,
+            CURLOPT_SSL_VERIFYPEER => true,
+            CURLOPT_SSL_VERIFYHOST => 2,
+            CURLOPT_PROTOCOLS => CURLPROTO_HTTPS | CURLPROTO_HTTP,
+            CURLOPT_ENCODING => '',
+            CURLOPT_TCP_KEEPALIVE => 1,
+            CURLOPT_USERAGENT => HLS_UA,
+            CURLOPT_HTTPHEADER => $headers,
+            CURLOPT_HEADERFUNCTION => static function ($curl, string $headerLine) use (&$redirectLocation): int {
+                if (stripos($headerLine, 'Location:') === 0) {
+                    $redirectLocation = trim(substr($headerLine, 9));
+                }
+                return strlen($headerLine);
+            },
+        ]);
+        apply_curl_proxy($ch);
+
+        $body = curl_exec($ch);
+        $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $error = curl_error($ch);
+        curl_close($ch);
+
+        if ($body === false) {
+            throw new RuntimeException('Playlist alınamadı: ' . $error);
+        }
+
+        if (in_array($status, [301, 302, 303, 307, 308], true) && is_string($redirectLocation) && $redirectLocation !== '') {
+            $currentUrl = absolute_url($currentUrl, $redirectLocation);
+            continue;
+        }
+
+        return [
+            'status' => $status,
+            'body' => (string) $body,
+            'final_url' => $currentUrl,
+        ];
+    }
+
+    throw new RuntimeException('Çok fazla yönlendirme.');
+}
+
+/* ---------------- İmza & Çalışan Profil Yönetimi ---------------- */
+function build_ping_payload(): array {
+    $time = (int) round(microtime(true) * 1000);
+    $deviceId = cache_read('device_uid', 21600);
+    if (!is_string($deviceId) || !preg_match('/^[a-f0-9]{32}$/', $deviceId)) {
+        $deviceId = bin2hex(random_bytes(16));
+        cache_write('device_uid', $deviceId, 21600);
+    }
+
+    return [
+        'reason' => 'app-focus',
+        'locale' => 'de',
+        'theme' => 'dark',
+        'metadata' => [
+            'device' => [
+                'type' => 'desktop',
+                'uniqueId' => $deviceId,
+            ],
+            'os' => [
+                'name' => 'win32',
+                'version' => 'Windows 10 Pro',
+                'abis' => ['x64'],
+                'host' => 'PC',
+            ],
+            'app' => ['platform' => 'electron'],
+            'version' => [
+                'package' => 'net.vypn.app',
+                'binary' => PING_APP_VERSION,
+                'js' => PING_APP_VERSION,
+            ],
+        ],
+        'appFocusTime' => 0,
+        'playerActive' => false,
+        'playDuration' => 0,
+        'devMode' => false,
+        'hasAddon' => true,
+        'castConnected' => false,
+        'package' => 'net.vypn.app',
+        'version' => PING_APP_VERSION,
+        'process' => 'app',
+        'firstAppStart' => $time,
+        'lastAppStart' => $time,
+        'ipLocation' => null,
+        'adblockEnabled' => true,
+        'proxy' => [
+            'supported' => ['ss'],
+            'engine' => 'Mu',
+            'enabled' => false,
+            'autoServer' => true,
+        ],
+        'iap' => ['supported' => false],
+    ];
+}
+
+function fetch_signature_upstream(): string {
+    $payload = build_ping_payload();
+    $urls = PING_URLS;
+    $lastGood = cache_read('last_good_ping', 3600);
+    if (is_string($lastGood) && in_array($lastGood, $urls, true)) {
+        $urls = array_values(array_unique(array_merge([$lastGood], $urls)));
+    }
+
+    $pingUas = [API_USER_AGENTS[0], UA];
+    $lastError = 'İmza alınamadı.';
+
+    foreach ($urls as $url) {
+        foreach ($pingUas as $pingUa) {
+            if (budget() < 2.0) {
+                break 2;
+            }
+            try {
+                $response = post_json($url, $payload, [], PING_TIMEOUT, $pingUa);
+                if ($response['status'] < 200 || $response['status'] >= 300) {
+                    $lastError = 'Ping HTTP ' . $response['status'] . ' (' . parse_url($url, PHP_URL_HOST) . ')';
+                    continue;
+                }
+                $data = $response['json'];
+                if (!is_array($data)) {
+                    $lastError = 'Ping JSON yok';
+                    continue;
+                }
+                foreach (['sig', 'addonSig', 'signature', 'token'] as $key) {
+                    $value = $data[$key] ?? null;
+                    if (is_string($value) && $value !== '' && !preg_match('/[\r\n]/', $value)) {
+                        cache_write('last_good_ping', $url, 3600);
+                        return $value;
+                    }
+                }
+            } catch (Throwable $ex) {
+                $lastError = $ex->getMessage();
+            }
+        }
+    }
+
+    throw new RuntimeException($lastError);
+}
+
+function signature(bool $refresh = false): string {
+    $value = cache_fetch_swr(
+        'signature',
+        SIGNATURE_TTL,
+        SIGNATURE_STALE_TTL,
+        fn () => fetch_signature_upstream(),
+        $refresh,
+        5
+    );
+
+    if (!is_string($value) || $value === '') {
+        throw new RuntimeException('Geçersiz imza.');
+    }
+    return $value;
+}
+
+function get_saved_profile(): ?array {
+    $p = cache_read('last_good_profile', 21600);
+    if (
+        is_array($p)
+        && !empty($p['domain'])
+        && in_array($p['domain'], UPSTREAM_DOMAINS, true)
+        && !empty($p['ua'])
+        && in_array($p['ua'], API_USER_AGENTS, true)
+    ) {
+        return [
+            'domain' => $p['domain'],
+            'play_path' => (!empty($p['play_path']) && in_array($p['play_path'], PLAY_PATHS, true))
+                ? $p['play_path']
+                : PLAY_PATHS[0],
+            'ua' => $p['ua'],
+        ];
+    }
+    return null;
+}
+
+function save_working_profile(string $domain, string $playPath, string $ua): void {
+    cache_write('last_good_profile', [
+        'domain' => $domain,
+        'play_path' => $playPath,
+        'ua' => $ua,
+    ], 21600);
+}
+
+function active_upstream_domain(): string {
+    $p = get_saved_profile();
+    return $p['domain'] ?? UPSTREAM_DOMAINS[0];
+}
+
+function api_single_call(string $endpoint, array $payload, string $ua, bool &$refreshedSig): array {
+    $sig = signature(false);
+    $res = post_json($endpoint, $payload, ['mediahubmx-signature: ' . $sig], null, $ua);
+
+    if (
+        !$refreshedSig
+        && !is_cloudflare_challenge($res['status'], $res['body'], $res['headers'])
+        && in_array($res['status'], [401, 403], true)
+    ) {
+        $refreshedSig = true;
+        $sig = signature(true);
+        $res = post_json($endpoint, $payload, ['mediahubmx-signature: ' . $sig], null, $ua);
+    }
+
+    return $res;
+}
+
+/* ---------------- Kanal Çözümleme ---------------- */
+function find_stream(array $data): ?string {
+    $items = [$data];
+    foreach ($data as $value) {
+        if (is_array($value)) {
+            $items[] = $value;
+        }
+    }
+
+    foreach ($items as $item) {
+        foreach (['url', 'stream'] as $key) {
+            $url = $item[$key] ?? null;
+            if (is_string($url) && is_public_http_url($url)) {
+                return $url;
+            }
+        }
+    }
+    return null;
+}
+
+function extract_token(string $url): ?string {
+    $query = parse_url($url, PHP_URL_QUERY);
+    if (!$query) {
+        return null;
+    }
+    parse_str($query, $params);
+    foreach (['token', 'sig', 'sign', 'auth', 'key'] as $key) {
+        if (!empty($params[$key]) && is_string($params[$key])) {
+            return $params[$key];
+        }
+    }
+    return null;
+}
+
+function extract_expiry(string $url): ?int {
+    $query = parse_url($url, PHP_URL_QUERY);
+    if (!$query) {
+        return null;
+    }
+    parse_str($query, $params);
+    foreach (['exp', 'expires', 'expiry', 'expire', 'ttl'] as $key) {
+        if (isset($params[$key]) && is_numeric($params[$key])) {
+            $value = (int) $params[$key];
+            return $value > 1000000000 ? $value : time() + $value;
+        }
+    }
+    return null;
+}
+
+function resolve_channel_upstream(string $id): array {
+    $saved = get_saved_profile();
+    $domains = $saved ? array_values(array_unique(array_merge([$saved['domain']], UPSTREAM_DOMAINS))) : UPSTREAM_DOMAINS;
+    $uas = $saved ? array_values(array_unique(array_merge([$saved['ua']], API_USER_AGENTS))) : API_USER_AGENTS;
+    $playPaths = $saved ? array_values(array_unique(array_merge([$saved['play_path']], PLAY_PATHS))) : PLAY_PATHS;
+
+    $refreshedSig = false;
+    $lastError = 'Yayın adresi bulunamadı.';
+    $blockedCombos = [];
+
+    // İlk olarak kayıtlı çalışan profili doğrudan dene
+    $candidates = [];
+    if ($saved !== null) {
+        $candidates[] = [$saved['domain'], $saved['ua'], $saved['play_path']];
+    }
+    foreach ($domains as $d) {
+        foreach ($uas as $u) {
+            foreach ($playPaths as $pp) {
+                if ($saved !== null && $d === $saved['domain'] && $u === $saved['ua'] && $pp === $saved['play_path']) {
+                    continue;
+                }
+                $candidates[] = [$d, $u, $pp];
+            }
+        }
+    }
+
+    foreach ($candidates as [$domain, $ua, $playPath]) {
+        if (budget() < 2.5) {
+            break;
+        }
+        $comboKey = $domain . '|' . $ua;
+        if (isset($blockedCombos[$comboKey])) {
+            continue;
+        }
+
+        try {
+            $res = api_single_call(
+                $domain . '/mediahubmx-resolve.json',
+                [
+                    'language' => 'de',
+                    'region' => 'AT',
+                    'url' => $domain . $playPath . $id,
+                    'clientVersion' => CLIENT_VERSION,
+                ],
+                $ua,
+                $refreshedSig
+            );
+
+            if (is_cloudflare_challenge($res['status'], $res['body'], $res['headers'])) {
+                $blockedCombos[$comboKey] = true;
+                $lastError = 'Cloudflare koruması (' . parse_url($domain, PHP_URL_HOST) . ' / HTTP ' . $res['status'] . ')';
+                continue;
+            }
+
+            if ($res['status'] < 200 || $res['status'] >= 300 || !is_array($res['json'])) {
+                if ($res['status'] >= 400) {
+                    $blockedCombos[$comboKey] = true;
+                }
+                $lastError = parse_url($domain, PHP_URL_HOST) . ' HTTP ' . $res['status'];
+                continue;
+            }
+
+            $url = find_stream($res['json']);
+            if ($url !== null) {
+                save_working_profile($domain, $playPath, $ua);
+                return [
+                    'url' => $url,
+                    'domain' => $domain,
+                ];
+            }
+            $lastError = parse_url($domain, PHP_URL_HOST) . ' (' . $playPath . ') stream boş';
+        } catch (Throwable $ex) {
+            $blockedCombos[$comboKey] = true;
+            $lastError = parse_url($domain, PHP_URL_HOST) . ': ' . $ex->getMessage();
+        }
+    }
+
+    throw new RuntimeException($lastError);
+}
+
+function resolve_channel(string $id, ?string $rejectedUrl = null, bool $force = false): array {
+    $cacheKey = 'stream_' . $id;
+    $forceRefresh = $force;
+
+    if (!$forceRefresh && $rejectedUrl !== null) {
+        $current = cache_read_entry($cacheKey);
+        if ($current !== null && is_array($current['v']) && ($current['v']['url'] ?? '') === $rejectedUrl) {
+            $forceRefresh = true;
+        }
+    }
+
+    $result = cache_fetch_swr(
+        $cacheKey,
+        RESOLVE_TTL_DEFAULT,
+        RESOLVE_STALE_TTL,
+        function () use ($id) {
+            $resolved = resolve_channel_upstream($id);
+            $url = $resolved['url'];
+            $now = time();
+            $expiry = extract_expiry($url);
+
+            if ($expiry !== null && $expiry <= $now) {
+                $dynamicTtl = 3;
+                $effectiveExpiry = $now + 15;
+            } elseif ($expiry !== null) {
+                $lifetime = $expiry - $now;
+                $lead = max(4, min(18, (int) floor($lifetime * 0.35)));
+                $dynamicTtl = max(3, min(25, $lifetime - $lead));
+                $effectiveExpiry = $expiry;
+            } else {
+                $dynamicTtl = RESOLVE_TTL_DEFAULT;
+                $effectiveExpiry = $now + 40;
+            }
+
+            return [
+                '__ttl' => $dynamicTtl,
+                '__value' => [
+                    'url' => $url,
+                    'domain' => $resolved['domain'],
+                    'token' => extract_token($url),
+                    'expires_at' => $effectiveExpiry,
+                    'refresh_seconds' => max(5, $effectiveExpiry - $now),
+                ],
+            ];
+        },
+        $forceRefresh,
+        1
+    );
+
+    if (!is_array($result) || empty($result['url'])) {
+        throw new RuntimeException('Yayın adresi çözümlenemedi.');
+    }
+
+    return $result;
+}
+
+/* ---------------- HLS Playlist, Varyant Haritası & Sarmalama ---------------- */
+function normalize_url_path(string $path): string {
+    $isDir = str_ends_with($path, '/');
+    $segments = explode('/', $path);
+    $stack = [];
+    foreach ($segments as $seg) {
+        if ($seg === '' || $seg === '.') {
+            continue;
+        }
+        if ($seg === '..') {
+            array_pop($stack);
+            continue;
+        }
+        $stack[] = $seg;
+    }
+    $normalized = '/' . implode('/', $stack);
+    if ($isDir && $normalized !== '/') {
+        $normalized .= '/';
+    }
+    return $normalized;
+}
+
+function absolute_url(string $base, string $relative): string {
+    if (preg_match('/^(https?:)?\/\//i', $relative)) {
+        if (str_starts_with($relative, '//')) {
+            $parts = parse_url($base);
+            return ($parts['scheme'] ?? 'https') . ':' . $relative;
+        }
+        return $relative;
+    }
+
+    $parts = parse_url($base);
+    if (
+        !is_array($parts)
+        || empty($parts['scheme'])
+        || empty($parts['host'])
+    ) {
+        return $relative;
+    }
+
+    $root = $parts['scheme'] . '://'
+        . $parts['host']
+        . (isset($parts['port']) ? ':' . $parts['port'] : '');
+
+    if (str_starts_with($relative, '?')) {
+        $basePath = $parts['path'] ?? '/';
+        return $root . $basePath . $relative;
+    }
+
+    if (str_starts_with($relative, '/')) {
+        $qPos = strpos($relative, '?');
+        if ($qPos !== false) {
+            return $root . normalize_url_path(substr($relative, 0, $qPos)) . substr($relative, $qPos);
+        }
+        return $root . normalize_url_path($relative);
+    }
+
+    $basePath = $parts['path'] ?? '/';
+    $lastSlash = strrpos($basePath, '/');
+    $baseDir = $lastSlash !== false ? substr($basePath, 0, $lastSlash + 1) : '/';
+    $qPos = strpos($relative, '?');
+    $relPath = $qPos !== false ? substr($relative, 0, $qPos) : $relative;
+    $relQuery = $qPos !== false ? substr($relative, $qPos) : '';
+
+    return $root . normalize_url_path($baseDir . $relPath) . $relQuery;
+}
+
+function variant_key(string $url): string {
+    $parts = parse_url($url);
+    if (!is_array($parts)) {
+        return $url;
+    }
+    $path = $parts['path'] ?? '/';
+    $kept = [];
+
+    if (!empty($parts['query'])) {
+        parse_str($parts['query'], $params);
+        $volatile = [
+            'token', 'sig', 'sign', 'auth', 'key', 'exp', 'expires',
+            'expiry', 'expire', 'ttl', 'hdnts', 'hdnea', 'wmsauthsign',
+            't', '_t', 'hash', 'h', 'st', 'e',
+        ];
+        foreach ($params as $k => $v) {
+            if (!in_array(strtolower((string) $k), $volatile, true)) {
+                $kept[$k] = $v;
+            }
+        }
+        ksort($kept);
+    }
+
+    return $path . ($kept !== [] ? '?' . http_build_query($kept) : '');
+}
+
+function hls_headers(?string $domain = null): array {
+    $origin = $domain ?: active_upstream_domain();
+    return [
+        'User-Agent: ' . HLS_UA,
+        'Accept: application/vnd.apple.mpegurl, application/x-mpegURL, */*',
+        'Accept-Language: tr,tr;q=0.9,en;q=0.8',
+        'Origin: ' . $origin,
+        'Referer: ' . $origin . '/',
+    ];
+}
+
+function parse_master_variants(string $masterPlaylist, string $baseUrl): array {
+    $lines = preg_split('/\r\n|\r|\n/', $masterPlaylist) ?: [];
+    $variants = [];
+    $pendingInf = null;
+    $idx = 0;
+
+    foreach ($lines as $line) {
+        $trimmed = trim($line);
+        if ($trimmed === '') {
+            continue;
+        }
+
+        if (str_starts_with($trimmed, '#EXT-X-MEDIA:')) {
+            if (preg_match('/URI="([^"]+)"/', $trimmed, $m)) {
+                $abs = absolute_url($baseUrl, $m[1]);
+                if (looks_like_playlist_url($abs)) {
+                    $vk = variant_key($abs);
+                    $type = preg_match('/TYPE=([A-Z-]+)/', $trimmed, $tm) ? $tm[1] : 'MEDIA';
+                    $group = preg_match('/GROUP-ID="([^"]+)"/', $trimmed, $gm) ? $gm[1] : '';
+                    $lang = preg_match('/LANGUAGE="([^"]+)"/', $trimmed, $lm) ? $lm[1] : '';
+                    $variants[$vk] = [
+                        'url' => $abs,
+                        'idx' => $idx++,
+                        'kind' => 'media',
+                        'bw' => 0,
+                        'res' => $type . ':' . $group . ':' . $lang,
+                        'path' => (string) (parse_url($abs, PHP_URL_PATH) ?? ''),
+                    ];
+                }
+            }
+            continue;
+        }
+
+        if (str_starts_with($trimmed, '#EXT-X-STREAM-INF:')) {
+            $bw = preg_match('/BANDWIDTH=(\d+)/', $trimmed, $bm) ? (int) $bm[1] : 0;
+            $res = preg_match('/RESOLUTION=(\d+x\d+)/', $trimmed, $rm) ? $rm[1] : '';
+            $pendingInf = ['bw' => $bw, 'res' => $res];
+            continue;
+        }
+
+        if (str_starts_with($trimmed, '#')) {
+            continue;
+        }
+
+        if ($pendingInf !== null || looks_like_playlist_url($trimmed)) {
+            $abs = absolute_url($baseUrl, $trimmed);
+            $vk = variant_key($abs);
+            $variants[$vk] = [
+                'url' => $abs,
+                'idx' => $idx++,
+                'kind' => 'video',
+                'bw' => $pendingInf['bw'] ?? 0,
+                'res' => $pendingInf['res'] ?? '',
+                'path' => (string) (parse_url($abs, PHP_URL_PATH) ?? ''),
+            ];
+            $pendingInf = null;
+        }
+    }
+
+    return $variants;
+}
+
+function store_variant_map(string $id, string $masterUrl, string $masterBody, string $finalMasterUrl): array {
+    $variants = parse_master_variants($masterBody, $finalMasterUrl);
+    if ($variants === []) {
+        return [];
+    }
+    $map = [
+        'master_url' => $masterUrl,
+        'final_master_url' => $finalMasterUrl,
+        'updated_at' => time(),
+        'variants' => $variants,
+    ];
+    cache_write('vmap_' . $id, $map, 180);
+    return $map;
+}
+
+function match_variant_in_map(array $variants, string $oldSubUrl, ?array $previousMeta = null): ?string {
+    if ($variants === []) {
+        return null;
+    }
+
+    $vk = variant_key($oldSubUrl);
+    if (isset($variants[$vk]['url'])) {
+        return $variants[$vk]['url'];
+    }
+
+    $oldPath = (string) (parse_url($oldSubUrl, PHP_URL_PATH) ?? '');
+    $oldTail = basename($oldPath);
+
+    $bestUrl = null;
+    $bestScore = -1;
+
+    foreach ($variants as $v) {
+        $score = 0;
+        if ($oldTail !== '' && basename($v['path']) === $oldTail) {
+            $score += 5;
+        }
+        if ($previousMeta !== null) {
+            if (($previousMeta['kind'] ?? '') === $v['kind']) {
+                $score += 3;
+            }
+            if (!empty($previousMeta['res']) && $previousMeta['res'] === $v['res']) {
+                $score += 10;
+            }
+            if (!empty($previousMeta['bw']) && $previousMeta['bw'] === $v['bw']) {
+                $score += 8;
+            }
+            if (isset($previousMeta['idx']) && $previousMeta['idx'] === $v['idx']) {
+                $score += 4;
+            }
+        }
+        if ($score > $bestScore) {
+            $bestScore = $score;
+            $bestUrl = $v['url'];
+        }
+    }
+
+    if ($bestUrl !== null && $bestScore > 0) {
+        return $bestUrl;
+    }
+
+    $first = reset($variants);
+    return is_array($first) ? ($first['url'] ?? null) : null;
+}
+
+function wrap_sub_playlist_url(string $id, string $absoluteSubUrl): string {
+    if (defined('MASKED_LIVE_URL')) {
+        return MASKED_LIVE_URL
+            . '?sub=' . rawurlencode($absoluteSubUrl)
+            . '&sig=' . sign_sub_url($id, $absoluteSubUrl);
+    }
+
+    return BASE_URL
+        . '?p=live&id=' . rawurlencode($id)
+        . '&sub=' . rawurlencode($absoluteSubUrl)
+        . '&sig=' . sign_sub_url($id, $absoluteSubUrl)
+        . auth_query_suffix();
+}
+
+function looks_like_playlist_url(string $url): bool {
+    $path = strtolower((string) (parse_url($url, PHP_URL_PATH) ?? ''));
+    return str_ends_with($path, '.m3u8') || str_ends_with($path, '.m3u');
+}
+
+function rewrite_hls_playlist(string $playlist, string $finalUrl, string $id): string {
+    $lines = preg_split('/\r\n|\r|\n/', $playlist) ?: [];
+    $nextIsVariantPlaylist = false;
+
+    foreach ($lines as $i => $line) {
+        $trimmed = trim($line);
+        if ($trimmed === '') {
+            continue;
+        }
+
+        if (str_starts_with($trimmed, '#')) {
+            $isMediaTag = str_starts_with($trimmed, '#EXT-X-MEDIA:');
+            if (str_starts_with($trimmed, '#EXT-X-STREAM-INF:')) {
+                $nextIsVariantPlaylist = true;
+            }
+
+            $lines[$i] = preg_replace_callback(
+                '/URI="([^"]+)"/',
+                function ($m) use ($finalUrl, $id, $isMediaTag) {
+                    $uri = $m[1];
+                    if ($uri === '' || preg_match('/^(data|urn|skd):/i', $uri)) {
+                        return $m[0];
+                    }
+                    $abs = absolute_url($finalUrl, $uri);
+                    if ($isMediaTag && looks_like_playlist_url($abs)) {
+                        return 'URI="' . wrap_sub_playlist_url($id, $abs) . '"';
+                    }
+                    return 'URI="' . $abs . '"';
+                },
+                $line
+            ) ?? $line;
+            continue;
+        }
+
+        if (preg_match('/^(data|urn|skd):/i', $trimmed)) {
+            $nextIsVariantPlaylist = false;
+            continue;
+        }
+
+        $abs = absolute_url($finalUrl, $trimmed);
+        if ($nextIsVariantPlaylist || looks_like_playlist_url($abs)) {
+            $lines[$i] = wrap_sub_playlist_url($id, $abs);
+            $nextIsVariantPlaylist = false;
+        } else {
+            $lines[$i] = $abs;
+        }
+    }
+
+    return implode("\n", $lines) . "\n";
+}
+
+function refresh_master_and_match_variant(string $id, string $oldSubUrl, ?array $previousMeta, bool $forceResolve): string {
+    $stream = resolve_channel($id, null, $forceResolve);
+    $masterUrl = $stream['url'];
+    $headers = hls_headers($stream['domain'] ?? null);
+
+    $masterRes = cache_fetch_swr(
+        'master_' . $id . '_' . hash('sha256', $masterUrl),
+        10,
+        30,
+        function () use ($id, $masterUrl, $headers) {
+            $res = get_text($masterUrl, $headers);
+            if ($res['status'] < 200 || $res['status'] >= 300) {
+                throw new RuntimeException('Master playlist alınamadı. HTTP ' . $res['status']);
+            }
+            $final = $res['final_url'] ?: $masterUrl;
+            $map = store_variant_map($id, $masterUrl, $res['body'], $final);
+            return [
+                'body' => $res['body'],
+                'final_url' => $final,
+                'map' => $map,
+            ];
+        },
+        $forceResolve,
+        1
+    );
+
+    if (!is_array($masterRes)) {
+        throw new RuntimeException('Master playlist çözümlenemedi.');
+    }
+
+    $variants = $masterRes['map']['variants'] ?? [];
+    if ($variants !== []) {
+        $matched = match_variant_in_map($variants, $oldSubUrl, $previousMeta);
+        if ($matched !== null) {
+            return $matched;
+        }
+    }
+
+    return $masterUrl;
+}
+
+function fetch_upstream_playlist(string $id, ?string $subUrl = null): string {
+    if ($subUrl !== null) {
+        $stream = resolve_channel($id);
+        $headers = hls_headers($stream['domain'] ?? null);
+        $vmap = cache_read('vmap_' . $id, 180);
+        $oldVk = variant_key($subUrl);
+        $previousMeta = is_array($vmap) ? ($vmap['variants'][$oldVk] ?? null) : null;
+
+        $targetSubUrl = $subUrl;
+        if (is_array($vmap) && ($vmap['master_url'] ?? '') !== $stream['url']) {
+            $targetSubUrl = refresh_master_and_match_variant($id, $subUrl, $previousMeta, false);
+        } elseif (is_array($vmap) && isset($vmap['variants'][$oldVk]['url'])) {
+            $targetSubUrl = $vmap['variants'][$oldVk]['url'];
+        }
+
+        $response = get_text($targetSubUrl, $headers);
+        if ($response['status'] >= 200 && $response['status'] < 300) {
+            return rewrite_hls_playlist(
+                $response['body'],
+                $response['final_url'] ?: $targetSubUrl,
+                $id
+            );
+        }
+
+        if (in_array($response['status'], [401, 403, 404, 410], true)) {
+            $freshVariantUrl = refresh_master_and_match_variant($id, $subUrl, $previousMeta, true);
+            $streamAfter = resolve_channel($id);
+            $fallback = get_text($freshVariantUrl, hls_headers($streamAfter['domain'] ?? null));
+            if ($fallback['status'] >= 200 && $fallback['status'] < 300) {
+                return rewrite_hls_playlist(
+                    $fallback['body'],
+                    $fallback['final_url'] ?: $freshVariantUrl,
+                    $id
+                );
+            }
+        }
+
+        throw new RuntimeException('Alt playlist alınamadı. HTTP ' . $response['status']);
+    }
+
+    $result = resolve_channel($id);
+    $upstream = $result['url'];
+    $headers = hls_headers($result['domain'] ?? null);
+    $response = get_text($upstream, $headers);
+
+    if (in_array($response['status'], [401, 403, 404, 410], true)) {
+        $result = resolve_channel($id, $upstream, true);
+        $upstream = $result['url'];
+        $headers = hls_headers($result['domain'] ?? null);
+        $response = get_text($upstream, $headers);
+    }
+
+    if ($response['status'] < 200 || $response['status'] >= 300) {
+        throw new RuntimeException('Playlist alınamadı. HTTP ' . $response['status']);
+    }
+
+    $finalUrl = $response['final_url'] ?: $upstream;
+    if (str_contains($response['body'], '#EXT-X-STREAM-INF:')) {
+        store_variant_map($id, $upstream, $response['body'], $finalUrl);
+    }
+
+    return rewrite_hls_playlist($response['body'], $finalUrl, $id);
+}
+
+function live_playlist(string $id, ?string $subUrl = null): never {
+    $prefix = defined('MASKED_LIVE_URL')
+        ? 'plm_' . hash('sha256', (string) MASKED_LIVE_URL) . '_'
+        : 'pl_';
+
+    $cacheKey = $subUrl === null
+        ? $prefix . $id
+        : $prefix . $id . '_' . hash('sha256', variant_key($subUrl));
+
+    $playlist = cache_fetch_swr(
+        $cacheKey,
+        PLAYLIST_TTL,
+        PLAYLIST_STALE_TTL,
+        fn () => fetch_upstream_playlist($id, $subUrl)
+    );
+
+    if (!is_string($playlist) || $playlist === '') {
+        fail(502, 'Boş playlist yanıtı.');
+    }
+
+    send_compressed(
+        $playlist,
+        'application/vnd.apple.mpegurl; charset=utf-8',
+        ['Access-Control-Allow-Origin: *']
+    );
+}
+
+/* ---------------- Katalog & M3U ---------------- */
+function m3u_text(string $value): string {
+    return trim(str_replace(
+        ["\r", "\n", '"'],
+        [' ', ' ', "'"],
+        $value
+    ));
+}
+
+function parse_catalog_items(array $items, string $group, array &$channels): void {
+    foreach ($items as $item) {
+        if (!is_array($item)) {
+            continue;
+        }
+
+        $ids = is_array($item['ids'] ?? null) ? $item['ids'] : [];
+        $images = is_array($item['images'] ?? null) ? $item['images'] : [];
+        $id = $ids['id'] ?? $item['id'] ?? '';
+
+        if (!is_scalar($id) || !preg_match(ID_PATTERN, (string) $id)) {
+            continue;
+        }
+
+        $name = $item['name'] ?? '';
+        $logo = $images['logo'] ?? $images['poster'] ?? $item['logo'] ?? '';
+        $tvg = $ids['tvg'] ?? '';
+
+        $id = (string) $id;
+        $channels[$id] = [
+            'id' => $id,
+            'name' => is_string($name) && $name !== '' ? $name : 'Kanal ' . $id,
+            'group' => is_string($item['group'] ?? null) && $item['group'] !== '' ? $item['group'] : $group,
+            'logo' => is_string($logo) && is_public_http_url($logo) ? $logo : '',
+            'tvg' => is_scalar($tvg) ? (string) $tvg : '',
+        ];
+    }
+}
+
+function discover_catalog_profile(): array {
+    $saved = get_saved_profile();
+    $domains = $saved ? array_values(array_unique(array_merge([$saved['domain']], UPSTREAM_DOMAINS))) : UPSTREAM_DOMAINS;
+    $uas = $saved ? array_values(array_unique(array_merge([$saved['ua']], API_USER_AGENTS))) : API_USER_AGENTS;
+    $refreshedSig = false;
+    $lastError = 'Katalog kaynağına ulaşılamadı.';
+
+    foreach ($domains as $domain) {
+        foreach ($uas as $ua) {
+            if (budget() < 2.5) {
+                break 2;
+            }
+            try {
+                $res = api_single_call(
+                    $domain . '/mediahubmx-catalog.json',
+                    [
+                        'language' => 'de',
+                        'region' => 'AT',
+                        'catalogId' => 'iptv',
+                        'id' => 'iptv',
+                        'adult' => false,
+                        'search' => '',
+                        'sort' => 'name',
+                        'filter' => ['group' => 'Turkey'],
+                        'cursor' => 0,
+                        'clientVersion' => CLIENT_VERSION,
+                    ],
+                    $ua,
+                    $refreshedSig
+                );
+
+                if (is_cloudflare_challenge($res['status'], $res['body'], $res['headers'])) {
+                    $lastError = 'Cloudflare koruması (' . parse_url($domain, PHP_URL_HOST) . ')';
+                    continue;
+                }
+                if ($res['status'] >= 200 && $res['status'] < 300 && is_array($res['json']) && is_array($res['json']['items'] ?? null)) {
+                    save_working_profile($domain, $saved['play_path'] ?? PLAY_PATHS[0], $ua);
+                    return ['domain' => $domain, 'ua' => $ua];
+                }
+                $lastError = parse_url($domain, PHP_URL_HOST) . ' HTTP ' . $res['status'];
+            } catch (Throwable $ex) {
+                $lastError = $ex->getMessage();
+            }
+        }
+    }
+
+    throw new RuntimeException($lastError);
+}
+
+function fetch_catalog_single(string $group): array {
+    $profile = discover_catalog_profile();
+    $domain = $profile['domain'];
+    $ua = $profile['ua'];
+    $refreshedSig = false;
+
+    $cursor = 0;
+    $seen = [];
+    $channels = [];
+    $finished = false;
+
+    for ($page = 0; $page < 15; $page++) {
+        $res = api_single_call(
+            $domain . '/mediahubmx-catalog.json',
+            [
+                'language' => 'de',
+                'region' => 'AT',
+                'catalogId' => 'iptv',
+                'id' => 'iptv',
+                'adult' => false,
+                'search' => '',
+                'sort' => 'name',
+                'filter' => ['group' => $group],
+                'cursor' => $cursor,
+                'clientVersion' => CLIENT_VERSION,
+            ],
+            $ua,
+            $refreshedSig
+        );
+
+        if ($res['status'] < 200 || $res['status'] >= 300 || !is_array($res['json'])) {
+            throw new RuntimeException('Katalog HTTP ' . $res['status']);
+        }
+
+        $items = $res['json']['items'] ?? null;
+        if (!is_array($items)) {
+            throw new RuntimeException('Katalog items yok.');
+        }
+
+        if ($items === []) {
+            $finished = true;
+            break;
+        }
+
+        parse_catalog_items($items, $group, $channels);
+
+        $next = $res['json']['nextCursor'] ?? null;
+        if ($next === null || $next === '' || $next === 0 || $next === false) {
+            $finished = true;
+            break;
+        }
+
+        $marker = json_encode($next);
+        if (isset($seen[$marker])) {
+            throw new RuntimeException('Katalog sayfalama döngüsü.');
+        }
+        $seen[$marker] = true;
+        $cursor = $next;
+    }
+
+    if (!$finished) {
+        throw new RuntimeException('Katalog 15 sayfa sınırını aştı.');
+    }
+
+    return array_values($channels);
+}
+
+function catalog(string $group): array {
+    $data = cache_fetch_swr(
+        'catalog-' . $group,
+        CATALOG_TTL,
+        CATALOG_STALE_TTL,
+        fn () => fetch_catalog_single($group)
+    );
+    return is_array($data) ? $data : [];
+}
+
+function catalog_many(array $groups, bool $forceRefresh = false): array {
+    $result = [];
+    $missing = [];
+
+    foreach ($groups as $group) {
+        $cached = $forceRefresh ? null : cache_read('catalog-' . $group, CATALOG_TTL);
+        if (is_array($cached) && $cached !== []) {
+            $result[$group] = $cached;
+        } else {
+            $missing[$group] = [
+                'cursor' => 0,
+                'seen' => [],
+                'channels' => [],
+                'finished' => false,
+            ];
+        }
+    }
+
+    if ($missing === []) {
+        return $result;
+    }
+
+    $profile = discover_catalog_profile();
+    $catalogUrl = $profile['domain'] . '/mediahubmx-catalog.json';
+    $ua = $profile['ua'];
+
+    $sig = signature(false);
+    $retriedAuth = false;
+
+    for ($page = 0; $page < 15 && $missing !== []; $page++) {
+        $batch = [];
+        foreach ($missing as $group => $state) {
+            $batch[$group] = [
+                'url' => $catalogUrl,
+                'ua' => $ua,
+                'headers' => ['mediahubmx-signature: ' . $sig],
+                'payload' => [
+                    'language' => 'de',
+                    'region' => 'AT',
+                    'catalogId' => 'iptv',
+                    'id' => 'iptv',
+                    'adult' => false,
+                    'search' => '',
+                    'sort' => 'name',
+                    'filter' => ['group' => $group],
+                    'cursor' => $state['cursor'],
+                    'clientVersion' => CLIENT_VERSION,
+                ],
+            ];
+        }
+
+        $responses = post_json_multi($batch);
+
+        $needAuthRetry = false;
+        if (!$retriedAuth) {
+            foreach ($responses as $res) {
+                if (in_array($res['status'], [401, 403], true) && !is_cloudflare_challenge($res['status'], $res['body'] ?? '')) {
+                    $needAuthRetry = true;
+                    break;
+                }
+            }
+        }
+
+        if ($needAuthRetry) {
+            $retriedAuth = true;
+            $sig = signature(true);
+            foreach ($batch as $group => $req) {
+                $batch[$group]['headers'] = ['mediahubmx-signature: ' . $sig];
+            }
+            $responses = post_json_multi($batch);
+        }
+
+        foreach ($responses as $group => $res) {
+            if ($res['status'] < 200 || $res['status'] >= 300 || !is_array($res['json'])) {
+                $stale = cache_read_entry('catalog-' . $group);
+                $result[$group] = ($stale !== null && is_array($stale['v'])) ? $stale['v'] : [];
+                unset($missing[$group]);
+                continue;
+            }
+
+            $items = $res['json']['items'] ?? null;
+            if (!is_array($items) || $items === []) {
+                $channels = array_values($missing[$group]['channels']);
+                if ($channels !== []) {
+                    cache_write('catalog-' . $group, $channels);
+                }
+                $result[$group] = $channels;
+                unset($missing[$group]);
+                continue;
+            }
+
+            parse_catalog_items($items, $group, $missing[$group]['channels']);
+
+            $next = $res['json']['nextCursor'] ?? null;
+            $marker = json_encode($next);
+
+            if (
+                $next === null
+                || $next === ''
+                || $next === 0
+                || $next === false
+                || isset($missing[$group]['seen'][$marker])
+            ) {
+                $channels = array_values($missing[$group]['channels']);
+                if ($channels !== []) {
+                    cache_write('catalog-' . $group, $channels);
+                }
+                $result[$group] = $channels;
+                unset($missing[$group]);
+                continue;
+            }
+
+            $missing[$group]['seen'][$marker] = true;
+            $missing[$group]['cursor'] = $next;
+        }
+    }
+
+    foreach ($missing as $group => $state) {
+        $channels = array_values($state['channels']);
+        if ($channels !== []) {
+            cache_write('catalog-' . $group, $channels);
+        }
+        $result[$group] = $channels;
+    }
+
+    return $result;
+}
+
+if (!function_exists('build_m3u')) {
+    function build_m3u(array $channels): string {
+        usort($channels, static fn ($a, $b) => strnatcasecmp($a['name'], $b['name']));
+
+        $lines = ['#EXTM3U'];
+        $suffix = auth_query_suffix();
+
+        foreach ($channels as $channel) {
+            $lines[] = '#EXTINF:-1'
+                . ' tvg-id="' . m3u_text($channel['tvg']) . '"'
+                . ' tvg-name="' . m3u_text($channel['name']) . '"'
+                . ' tvg-logo="' . m3u_text($channel['logo']) . '"'
+                . ' group-title="' . m3u_text($channel['group']) . '",'
+                . m3u_text($channel['name']);
+            $lines[] = BASE_URL . '?p=live&id=' . rawurlencode($channel['id']) . $suffix;
+        }
+
+        return implode("\n", $lines) . "\n";
+    }
+}
+
+/* ---------------- Teşhis (Diagnostics) ---------------- */
+function run_diagnostics(?string $testId = null): array {
+    $curlVer = function_exists('curl_version') ? (curl_version()['version'] ?? 'unknown') : 'missing';
+    $pingReport = [];
+    $sigValue = null;
+    $pingPayload = build_ping_payload();
+
+    foreach (PING_URLS as $url) {
+        $t0 = microtime(true);
+        try {
+            $res = post_json($url, $pingPayload, [], 4, API_USER_AGENTS[0]);
+            $hasSig = false;
+            if (is_array($res['json'])) {
+                foreach (['sig', 'addonSig', 'signature', 'token'] as $k) {
+                    if (!empty($res['json'][$k]) && is_string($res['json'][$k])) {
+                        $hasSig = true;
+                        if ($sigValue === null) {
+                            $sigValue = $res['json'][$k];
+                        }
+                        break;
+                    }
+                }
+            }
+            $pingReport[] = [
+                'url' => $url,
+                'status' => $res['status'],
+                'sig_ok' => $hasSig,
+                'cloudflare' => is_cloudflare_challenge($res['status'], $res['body'], $res['headers']),
+                'ms' => (int) round((microtime(true) - $t0) * 1000),
+            ];
+        } catch (Throwable $ex) {
+            $pingReport[] = [
+                'url' => $url,
+                'status' => 0,
+                'sig_ok' => false,
+                'error' => $ex->getMessage(),
+                'ms' => (int) round((microtime(true) - $t0) * 1000),
+            ];
+        }
+    }
+
+    $domainReport = [];
+    $testUas = [API_USER_AGENTS[0], 'VAVOO/2.6', UA];
+    foreach (UPSTREAM_DOMAINS as $domain) {
+        foreach ($testUas as $ua) {
+            if (budget() < 3.0) {
+                break 2;
+            }
+            $t0 = microtime(true);
+            try {
+                $headers = $sigValue !== null ? ['mediahubmx-signature: ' . $sigValue] : [];
+                $res = post_json(
+                    $domain . '/mediahubmx-catalog.json',
+                    [
+                        'language' => 'de',
+                        'region' => 'AT',
+                        'catalogId' => 'iptv',
+                        'id' => 'iptv',
+                        'adult' => false,
+                        'search' => 'TRT',
+                        'sort' => 'name',
+                        'filter' => ['group' => 'Turkey'],
+                        'cursor' => 0,
+                        'clientVersion' => CLIENT_VERSION,
+                    ],
+                    $headers,
+                    5,
+                    $ua
+                );
+                $cf = is_cloudflare_challenge($res['status'], $res['body'], $res['headers']);
+                $itemsOk = is_array($res['json']) && is_array($res['json']['items'] ?? null);
+                $domainReport[] = [
+                    'domain' => $domain,
+                    'ua' => $ua === UA ? 'Chrome' : $ua,
+                    'status' => $res['status'],
+                    'cloudflare_challenge' => $cf,
+                    'json_items_ok' => $itemsOk,
+                    'ms' => (int) round((microtime(true) - $t0) * 1000),
+                ];
+                if ($itemsOk) {
+                    break;
+                }
+            } catch (Throwable $ex) {
+                $domainReport[] = [
+                    'domain' => $domain,
+                    'ua' => $ua === UA ? 'Chrome' : $ua,
+                    'status' => 0,
+                    'error' => $ex->getMessage(),
+                    'ms' => (int) round((microtime(true) - $t0) * 1000),
+                ];
+            }
+        }
+    }
+
+    $channelReport = null;
+    if ($testId !== null && preg_match(ID_PATTERN, $testId)) {
+        try {
+            $stream = resolve_channel($testId, null, true);
+            $pl = get_text($stream['url'], hls_headers($stream['domain'] ?? null));
+            $channelReport = [
+                'id' => $testId,
+                'ok' => $pl['status'] >= 200 && $pl['status'] < 300,
+                'domain' => $stream['domain'] ?? null,
+                'playlist_status' => $pl['status'],
+                'is_m3u8' => str_contains($pl['body'], '#EXTM3U'),
+            ];
+        } catch (Throwable $ex) {
+            $channelReport = [
+                'id' => $testId,
+                'ok' => false,
+                'error' => $ex->getMessage(),
+            ];
+        }
+    }
+
+    return [
+        'version' => STREAM_LIB_VERSION,
+        'php' => PHP_VERSION,
+        'curl' => $curlVer,
+        'proxy_configured' => UPSTREAM_PROXY !== '',
+        'cache_writable' => cache_dir() !== null,
+        'saved_profile' => get_saved_profile(),
+        'ping' => $pingReport,
+        'domains' => $domainReport,
+        'channel_test' => $channelReport,
+    ];
+}
+
+/* ---------------- Player ---------------- */
+function render_player(string $id): string {
+    $jsBase = json_encode(BASE_URL, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+    $jsId = json_encode($id, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+    $playerToken = ACCESS_KEY !== '' ? create_player_token($id) : '';
+    $jsPt = json_encode($playerToken, JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+    $titleId = e($id);
+
+    return <<<HTML
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Canlı Yayın — {$titleId}</title>
+<style>
+html,body{margin:0;height:100%;background:#0b1220;color:#e7edf7;font-family:system-ui,-apple-system,sans-serif}
+.wrap{display:flex;flex-direction:column;align-items:center;justify-content:center;height:100%;padding:12px;box-sizing:border-box}
+.bar{width:100%;max-width:1080px;display:flex;align-items:center;justify-content:space-between;margin:0 0 10px;gap:12px}
+h1{font-size:16px;margin:0;font-weight:600}
+button{background:#1e293b;color:#e7edf7;border:1px solid #334155;border-radius:8px;padding:6px 12px;font-size:12px;cursor:pointer}
+button:hover{background:#334155}
+video{width:100%;max-width:1080px;border-radius:12px;background:#000;aspect-ratio:16/9}
+#error{color:#f87171;margin-top:8px;font-size:13px;min-height:1em}
+#status{color:#9ca3af;margin-top:4px;font-size:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="bar">
+    <h1>Canlı Yayın</h1>
+    <button id="unmuteBtn" type="button">Sesi Aç</button>
+  </div>
+  <video id="video" controls autoplay playsinline muted></video>
+  <div id="status">Bağlanıyor...</div>
+  <div id="error"></div>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1/dist/hls.min.js"></script>
+<script>
+const BASE = {$jsBase};
+const ID = {$jsId};
+const PT = {$jsPt};
+const video = document.getElementById('video');
+const statusBox = document.getElementById('status');
+const errorBox = document.getElementById('error');
+const unmuteBtn = document.getElementById('unmuteBtn');
+
+unmuteBtn.addEventListener('click', () => {
+  video.muted = !video.muted;
+  unmuteBtn.textContent = video.muted ? 'Sesi Aç' : 'Sesi Kapat';
+});
+
+function streamUrl() {
+  let u = BASE + '?p=live&id=' + encodeURIComponent(ID);
+  if (PT) u += '&pt=' + encodeURIComponent(PT);
+  return u;
+}
+
+let hls = null;
+let softRetry = 0;
+let hardRetry = 0;
+let retryTimer = null;
+let lastProgressAt = Date.now();
+let lastTime = -1;
+
+function clearRetryTimer() {
+  if (retryTimer) {
+    clearTimeout(retryTimer);
+    retryTimer = null;
+  }
+}
+
+function scheduleRestart(delayMs) {
+  clearRetryTimer();
+  retryTimer = setTimeout(start, delayMs);
+}
+
+function start() {
+  clearRetryTimer();
+  errorBox.textContent = '';
+
+  if (hls) {
+    try { hls.destroy(); } catch (_) {}
+    hls = null;
+  }
+
+  if (window.Hls && Hls.isSupported()) {
+    hls = new Hls({
+      liveSyncDurationCount: 3,
+      liveMaxLatencyDurationCount: 10,
+      maxBufferLength: 30,
+      maxMaxBufferLength: 60,
+      backBufferLength: 30,
+      manifestLoadingTimeOut: 15000,
+      manifestLoadingMaxRetry: 8,
+      manifestLoadingRetryDelay: 1200,
+      levelLoadingTimeOut: 15000,
+      levelLoadingMaxRetry: 8,
+      levelLoadingRetryDelay: 1200,
+      fragLoadingTimeOut: 18000,
+      fragLoadingMaxRetry: 8,
+      fragLoadingRetryDelay: 1200,
+      enableWorker: true
+    });
+
+    hls.loadSource(streamUrl());
+    hls.attachMedia(video);
+
+    hls.on(Hls.Events.MANIFEST_PARSED, () => {
+      statusBox.textContent = '';
+      softRetry = 0;
+      hardRetry = 0;
+      video.play().catch(() => {});
+    });
+
+    hls.on(Hls.Events.FRAG_BUFFERED, () => {
+      statusBox.textContent = '';
+      errorBox.textContent = '';
+      softRetry = 0;
+      hardRetry = 0;
+      lastProgressAt = Date.now();
+    });
+
+    hls.on(Hls.Events.ERROR, (_, data) => {
+      if (!data.fatal) return;
+
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        softRetry++;
+        if (softRetry <= 4) {
+          statusBox.textContent = 'Bağlantı tazeleniyor...';
+          setTimeout(() => {
+            if (hls) hls.startLoad();
+          }, 1200 * softRetry);
+          return;
+        }
+      } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        softRetry++;
+        if (softRetry <= 2) {
+          statusBox.textContent = 'Yayın toparlanıyor...';
+          hls.recoverMediaError();
+          return;
+        }
+      }
+
+      hardRetry++;
+      const delay = Math.min(15000, 1500 * Math.min(hardRetry, 6));
+      statusBox.textContent = 'Yeniden bağlanıyor...';
+      errorBox.textContent = 'Yayın geçici olarak kesildi, tekrar deneniyor.';
+      scheduleRestart(delay);
+    });
+
+    setInterval(() => {
+      if (video.paused || video.ended) return;
+      if (video.currentTime !== lastTime) {
+        lastTime = video.currentTime;
+        lastProgressAt = Date.now();
+      } else if (Date.now() - lastProgressAt > 35000) {
+        lastProgressAt = Date.now();
+        if (hls) {
+          statusBox.textContent = 'Akış senkronize ediliyor...';
+          hls.startLoad();
+        }
+      }
+    }, 5000);
+  } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    video.src = streamUrl();
+    video.addEventListener('loadedmetadata', () => {
+      statusBox.textContent = '';
+      video.play().catch(() => {});
+    }, { once: true });
+    video.addEventListener('error', () => {
+      hardRetry++;
+      const delay = Math.min(15000, 1500 * Math.min(hardRetry, 6));
+      statusBox.textContent = 'Yeniden bağlanıyor...';
+      clearRetryTimer();
+      retryTimer = setTimeout(() => {
+        video.src = streamUrl() + '&_t=' + Date.now();
+        video.load();
+      }, delay);
+    });
+  } else {
+    errorBox.textContent = 'Tarayıcınız HLS oynatmayı desteklemiyor.';
+  }
+}
+
+window.addEventListener('online', () => {
+  if (hls) hls.startLoad();
+});
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden && hls && video.paused === false) {
+    hls.startLoad();
+  }
+});
+
+start();
+</script>
+</body>
+</html>
+HTML;
+}
+
+/* ---------------- Main ---------------- */
+if (!defined('STREAM_AS_LIBRARY')) {
+    if (param('p') === '' && !isset($_GET['list']) && !isset($_GET['go'])) {
+        $reqPath = !empty($_SERVER['PATH_INFO']) && is_string($_SERVER['PATH_INFO'])
+            ? $_SERVER['PATH_INFO']
+            : (string) (parse_url((string) ($_SERVER['REQUEST_URI'] ?? ''), PHP_URL_PATH) ?? '');
+        $scriptDir = rtrim(str_replace('\\', '/', dirname((string) ($_SERVER['SCRIPT_NAME'] ?? '/'))), '/');
+        if ($scriptDir !== '' && str_starts_with($reqPath, $scriptDir . '/')) {
+            $reqPath = substr($reqPath, strlen($scriptDir));
+        }
+        $candidateSlug = trim($reqPath, '/');
+
+        if (str_ends_with(strtolower($candidateSlug), '.m3u') && is_file(__DIR__ . '/m3u.php')) {
+            $m3uSlug = substr($candidateSlug, 0, -4);
+            if (preg_match('/^[A-Za-z0-9_-]{1,64}$/', $m3uSlug)) {
+                $_GET['slug'] = $m3uSlug;
+                require __DIR__ . '/m3u.php';
+                exit;
+            }
+        }
+
+        if (is_file(__DIR__ . '/panel.php')) {
+            $cleanSlug = str_ends_with(strtolower($candidateSlug), '.m3u8')
+                ? substr($candidateSlug, 0, -5)
+                : $candidateSlug;
+            if (
+                $candidateSlug !== ''
+                && !str_ends_with(strtolower($candidateSlug), '.php')
+                && !is_file(__DIR__ . '/' . $candidateSlug)
+                && preg_match('/^[A-Za-z0-9._-]{1,64}$/', $cleanSlug)
+            ) {
+                define('STREAM_AS_LIBRARY', true);
+                $_GET['go'] = $candidateSlug;
+                require __DIR__ . '/panel.php';
+                exit;
+            }
+        }
+    }
+
+    try {
+        if (!extension_loaded('curl')) {
+            fail(500, 'cURL etkin değil.');
+        }
+
+        $page = param('p');
+        $id = param('id');
+
+        if (ACCESS_KEY !== '') {
+            $providedKey = param('key');
+            $playerTok = param('pt');
+            $validKey = hash_equals(ACCESS_KEY, $providedKey);
+            $validPlayerToken = ($page === 'live' && preg_match(ID_PATTERN, $id) && verify_player_token($id, $playerTok));
+
+            if (!$validKey && !$validPlayerToken) {
+                fail(403, 'Erişim reddedildi.');
+            }
+        }
+
+        cache_gc();
+
+        if ($page === 'diag') {
+            json_out(run_diagnostics($id !== '' ? $id : null));
+        }
+
+        if ($page === 'player') {
+            if (!preg_match(ID_PATTERN, $id)) {
+                fail(400, 'Geçersiz kanal kimliği.');
+            }
+            html_out(render_player($id));
+        }
+
+        if ($page === 'live') {
+            if (!preg_match(ID_PATTERN, $id)) {
+                fail(400, 'Geçersiz kanal kimliği.');
+            }
+            $subUrl = null;
+            $rawSub = param('sub');
+            if ($rawSub !== '') {
+                $sig = param('sig');
+                $expectedSig = sign_sub_url($id, $rawSub);
+                if (!hash_equals($expectedSig, $sig) || !is_public_http_url($rawSub)) {
+                    fail(403, 'Geçersiz alt playlist imzası.');
+                }
+                $subUrl = $rawSub;
+            }
+            live_playlist($id, $subUrl);
+        }
+
+        if ($page === 'token') {
+            if (!preg_match(ID_PATTERN, $id)) {
+                fail(400, 'Geçersiz kanal kimliği.');
+            }
+            $result = resolve_channel($id);
+            json_out([
+                'ok' => true,
+                'id' => $id,
+                'domain' => $result['domain'] ?? null,
+                'token' => $result['token'],
+                'expires_at' => $result['expires_at'],
+                'refresh_seconds' => $result['refresh_seconds'],
+                'stream_url' => $result['url'],
+            ]);
+        }
+
+        if (isset($_GET['list'])) {
+            $group = preg_replace('/\.m3u$/i', '', trim(param('list')));
+
+            if ($group === '' || strcasecmp($group, 'all') === 0) {
+                $m3u = cache_fetch_swr(
+                    'm3u_all_' . hash('sha256', BASE_URL . ACCESS_KEY),
+                    CATALOG_TTL,
+                    CATALOG_STALE_TTL,
+                    function (): string {
+                        $byGroup = catalog_many(GROUPS);
+                        $channels = [];
+                        foreach (GROUPS as $name) {
+                            foreach ($byGroup[$name] ?? [] as $channel) {
+                                $channels[$channel['id']] = $channel;
+                            }
+                        }
+                        $channels = array_values($channels);
+                        if ($channels === []) {
+                            throw new RuntimeException('Kanal bulunamadı.');
+                        }
+                        return build_m3u($channels);
+                    }
+                );
+            } else {
+                if (strlen($group) > 80 || preg_match('/[\x00-\x1f\x7f]/', $group)) {
+                    fail(400, 'Geçersiz grup.');
+                }
+                $m3u = cache_fetch_swr(
+                    'm3u_' . $group . '_' . hash('sha256', BASE_URL . ACCESS_KEY),
+                    CATALOG_TTL,
+                    CATALOG_STALE_TTL,
+                    function () use ($group): string {
+                        $channels = catalog($group);
+                        if ($channels === []) {
+                            throw new RuntimeException('Kanal bulunamadı.');
+                        }
+                        return build_m3u($channels);
+                    }
+                );
+            }
+
+            if (!is_string($m3u) || $m3u === '') {
+                fail(404, 'Kanal bulunamadı.');
+            }
+
+            send_compressed(
+                $m3u,
+                'audio/x-mpegurl; charset=utf-8',
+                ['Content-Disposition: inline; filename="playlist.m3u"']
+            );
+        }
+
+        if ($page === 'countries') {
+            $summary = cache_fetch_swr(
+                'countries_summary',
+                CATALOG_TTL,
+                CATALOG_STALE_TTL,
+                function (): array {
+                    $byGroup = catalog_many(GROUPS);
+                    $counts = [];
+                    foreach (GROUPS as $group) {
+                        $counts[$group] = count($byGroup[$group] ?? []);
+                    }
+                    $total = array_sum($counts);
+                    if ($total === 0) {
+                        throw new RuntimeException('Ülke kataloğu boş.');
+                    }
+                    return [
+                        'total' => $total,
+                        'countries' => $counts,
+                    ];
+                }
+            );
+            json_out(is_array($summary) ? $summary : ['total' => 0, 'countries' => []]);
+        }
+
+        $suffix = auth_query_suffix();
+        header('Content-Type: text/plain; charset=utf-8');
+        echo "Düşük Kotalı & Çoklu Kaynaklı HLS API (v" . STREAM_LIB_VERSION . ")\n\n";
+        echo "Player: " . BASE_URL . "?p=player&id=KANAL_ID" . $suffix . "\n";
+        echo "HLS:    " . BASE_URL . "?p=live&id=KANAL_ID" . $suffix . "\n";
+        echo "Token:  " . BASE_URL . "?p=token&id=KANAL_ID" . $suffix . "\n";
+        echo "Teşhis: " . BASE_URL . "?p=diag" . $suffix . "\n";
+        echo "M3U:    " . BASE_URL . "?list=Turkey.m3u" . $suffix . "\n";
+    } catch (Throwable $ex) {
+        error_log('HLS API: ' . $ex->getMessage());
+        fail(503, 'Yayın geçici olarak alınamadı.', ['Retry-After: 2']);
+    }
+}
